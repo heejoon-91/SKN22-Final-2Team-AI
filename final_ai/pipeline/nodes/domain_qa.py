@@ -6,9 +6,9 @@ from final_ai.pipeline.utils import (
     DOMAIN_INTENT_TO_CATEGORY,
     LLM_MODEL,
     build_pet_context,
+    create_llm_completion,
     ensure_request_active,
-    get_db_connection,
-    llm,
+    trace_log,
 )
 
 
@@ -32,6 +32,12 @@ def _search_domain_pg(query: str, domain_intent: str | None, species: str | None
     if csv_path is None:
         print("[RAG] CSV 파일을 찾을 수 없습니다.")
         return []
+    trace_log(
+        "domain_csv_selected",
+        csv_path=str(csv_path),
+        domain_intent=domain_intent,
+        species=species,
+    )
 
     try:
         df = pd.read_csv(csv_path)
@@ -60,7 +66,12 @@ def _search_domain_pg(query: str, domain_intent: str | None, species: str | None
         if q or a:
             contexts.append(f"질문: {q}\n답변: {a}")
 
-    print(f"[RAG] {len(contexts)}개 컨텍스트 (csv={csv_path.name})")
+    trace_log(
+        "domain_csv_result",
+        csv_name=csv_path.name,
+        context_count=len(contexts),
+        keyword_count=len(keywords),
+    )
     return contexts
 
 
@@ -73,13 +84,14 @@ def general_node(state: ChatState) -> dict:
         f"펫 정보: {pet_ctx}\n질문: {state['user_input']}"
     )
     ensure_request_active()
-    refined = llm.chat.completions.create(
+    refined = create_llm_completion(
+        trace_label="general_node_refine_query",
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0,
     ).choices[0].message.content.strip()
 
-    print(f"[GENERAL] 정제 쿼리: {refined}")
+    trace_log("general_node_result", query=refined)
     return {"search_query": refined}
 
 
@@ -91,4 +103,11 @@ def rag_node(state: ChatState) -> dict:
     species       = (state.get("pet_profile") or {}).get("species")
 
     contexts = _search_domain_pg(query, domain_intent, species)
+    trace_log(
+        "rag_node_result",
+        query=query,
+        domain_intent=domain_intent,
+        species=species,
+        context_count=len(contexts),
+    )
     return {"domain_contexts": contexts}

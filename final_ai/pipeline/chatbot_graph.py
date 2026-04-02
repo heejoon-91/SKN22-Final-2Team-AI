@@ -1,3 +1,5 @@
+from functools import wraps
+
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Send
@@ -14,6 +16,49 @@ from final_ai.pipeline.nodes.recommend import (
 )
 from final_ai.pipeline.nodes.respond import respond_node
 from final_ai.pipeline.state import ChatState
+from final_ai.pipeline.utils import trace_block, trace_log
+
+
+def _summarize_state(state: ChatState) -> dict:
+    filters = state.get("filters") or {}
+    return {
+        "intents": state.get("intents"),
+        "category": filters.get("category"),
+        "subcategory": filters.get("subcategory"),
+        "pet_type": filters.get("pet_type"),
+        "user_input_chars": len(state.get("user_input") or ""),
+        "search_results": len(state.get("search_results") or []),
+        "reranked_results": len(state.get("reranked_results") or []),
+        "domain_contexts": len(state.get("domain_contexts") or []),
+        "product_cards": len(state.get("product_cards") or []),
+        "filter_relaxation_count": state.get("filter_relaxation_count"),
+        "clarification_count": state.get("clarification_count"),
+        "pet_mismatch": state.get("pet_mismatch"),
+    }
+
+
+def _trace_node(node_name: str, func):
+    @wraps(func)
+    def wrapper(state: ChatState):
+        trace_log("graph_node_enter", node=node_name, **_summarize_state(state))
+        with trace_block("graph_node", node=node_name):
+            result = func(state)
+        if isinstance(result, dict):
+            trace_log(
+                "graph_node_exit",
+                node=node_name,
+                response_chars=len(result.get("response") or ""),
+                search_results=len(result.get("search_results") or []),
+                reranked_results=len(result.get("reranked_results") or []),
+                domain_contexts=len(result.get("domain_contexts") or []),
+                product_cards=len(result.get("product_cards") or []),
+                recommend_retry_pending=result.get("recommend_retry_pending"),
+            )
+        else:
+            trace_log("graph_node_exit", node=node_name, result_type=type(result).__name__)
+        return result
+
+    return wrapper
 
 
 # ── 라우팅 함수 ────────────────────────────────────────────────────────────────
@@ -27,7 +72,14 @@ def route_intent(state: ChatState):
     pet_profile = state.get("pet_profile") or {}
     relaxation = state.get("filter_relaxation_count", 0)
 
-    print(f"[ROUTE_INTENT] intents={intents}, pet_type={filters.get('pet_type')}, species={pet_profile.get('species')}, category={filters.get('category')}")
+    trace_log(
+        "route_intent_eval",
+        intents=intents,
+        pet_type=filters.get("pet_type"),
+        species=pet_profile.get("species"),
+        category=filters.get("category"),
+        relaxation=relaxation,
+    )
 
     if "unclear" in intents:
         return "clarify"
@@ -67,8 +119,19 @@ def route_rerank(state: ChatState) -> str:
     retry_pending = bool(state.get("recommend_retry_pending"))
 
     if retry_pending:
-        print(f"[ROUTE_RERANK] 결과 {len(results)}개 → QUERY 재시도 (relaxation={relaxation})")
+        trace_log(
+            "route_rerank_retry",
+            result_count=len(results),
+            relaxation=relaxation,
+            retry_pending=retry_pending,
+        )
         return "query"
+    trace_log(
+        "route_rerank_merge",
+        result_count=len(results),
+        relaxation=relaxation,
+        retry_pending=retry_pending,
+    )
     return "merge"
 
 
@@ -78,16 +141,16 @@ def build_graph(checkpointer=None):
     g = StateGraph(ChatState)
 
     # 노드 등록
-    g.add_node("intent",  intent_node)
-    g.add_node("clarify", clarify_node)
-    g.add_node("general", general_node)
-    g.add_node("rag",     rag_node)
-    g.add_node("profile", profile_node)
-    g.add_node("query",   query_node)
-    g.add_node("search",  search_node)
-    g.add_node("rerank",  rerank_node)
-    g.add_node("merge",   merge_node)
-    g.add_node("respond", respond_node)
+    g.add_node("intent", _trace_node("intent", intent_node))
+    g.add_node("clarify", _trace_node("clarify", clarify_node))
+    g.add_node("general", _trace_node("general", general_node))
+    g.add_node("rag", _trace_node("rag", rag_node))
+    g.add_node("profile", _trace_node("profile", profile_node))
+    g.add_node("query", _trace_node("query", query_node))
+    g.add_node("search", _trace_node("search", search_node))
+    g.add_node("rerank", _trace_node("rerank", rerank_node))
+    g.add_node("merge", _trace_node("merge", merge_node))
+    g.add_node("respond", _trace_node("respond", respond_node))
 
     # 엣지
     g.add_edge(START, "intent")

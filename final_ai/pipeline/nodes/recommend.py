@@ -5,10 +5,13 @@ from final_ai.pipeline.state import ChatState
 from final_ai.pipeline.utils import (
     LLM_MODEL,
     build_pet_context,
+    create_llm_completion,
     ensure_request_active,
+    execute_traced,
+    get_db_connection,
     hybrid_search_pg,
-    llm,
     normalize_pet_species,
+    trace_log,
 )
 
 
@@ -23,8 +26,6 @@ def profile_node(state: ChatState) -> dict:
     """
     user_id가 있으면 DB에서 pet 정보를 조회하고, 해당 품종의 breed_meta 정보를 결합합니다.
     """
-    from final_ai.pipeline.utils import get_db_connection
-    
     user_id = state.get("user_id")
     target_pet_id = state.get("target_pet_id")
     pet_profile = dict(state.get("pet_profile") or {})
@@ -62,22 +63,35 @@ def profile_node(state: ChatState) -> dict:
             # [FIX] 사용자가 명시적으로 품종/종을 언급한 경우(is_pet_override), 
             # target_pet_id가 없다면 DB에서 최근 펫을 가져오지 않고 해당 입력 정보만 사용함.
             if target_pet_id:
-                cur.execute("""
+                execute_traced(
+                    cur,
+                    "profile_node_pet_lookup_by_id",
+                    """
                     SELECT pet_id, name, species, breed, age_years, age_months, weight_kg, gender, budget_range
                     FROM pet
                     WHERE user_id = %s AND pet_id = %s
                     LIMIT 1
-                """, (user_id, target_pet_id))
+                    """,
+                    (user_id, target_pet_id),
+                    user_id=user_id,
+                    pet_id=target_pet_id,
+                )
                 pet_row = cur.fetchone()
             elif is_pet_override:
                 # 명시적 override 상황에서는 DB 자동 조회를 건너뜀
                 pet_row = None
-                print(f"[PROFILE] Explicit pet override detected. Skipping DB auto-load.")
+                trace_log("profile_node_pet_override_skip_db")
             else:
-                cur.execute("""
+                execute_traced(
+                    cur,
+                    "profile_node_pet_lookup_latest",
+                    """
                     SELECT pet_id, name, species, breed, age_years, age_months, weight_kg, gender, budget_range
                     FROM pet WHERE user_id = %s ORDER BY created_at DESC LIMIT 1
-                """, (user_id,))
+                    """,
+                    (user_id,),
+                    user_id=user_id,
+                )
                 pet_row = cur.fetchone()
 
             if pet_row:
@@ -95,6 +109,15 @@ def profile_node(state: ChatState) -> dict:
                     # 2. 품종 불일치 체크 (채팅에서 품종을 언급 도중 등록 품종과 다를 때)
                     if target_breed and db_breed != target_breed:
                         pet_mismatch = True
+                trace_log(
+                    "profile_node_pet_compare",
+                    db_species=db_species,
+                    chat_species=chat_species,
+                    db_breed=db_breed,
+                    requested_breed=target_breed,
+                    pet_mismatch=pet_mismatch,
+                    is_pet_switched=is_pet_switched,
+                )
                 
                 # 불일치가 없거나 펫이 전환된 상황일 때만 프로필 업데이트 수행
                 if not pet_mismatch:
@@ -118,11 +141,29 @@ def profile_node(state: ChatState) -> dict:
                     elif budget_raw == "5_10":     budget_val = 100000
                     elif budget_raw == "10_20":    budget_val = 200000
                     
-                    cur.execute("SELECT concern FROM pet_health_concern WHERE pet_id = %s", (pet_id,))
+                    execute_traced(
+                        cur,
+                        "profile_node_health_concerns",
+                        "SELECT concern FROM pet_health_concern WHERE pet_id = %s",
+                        (pet_id,),
+                        pet_id=pet_id,
+                    )
                     health_concerns = [r[0] for r in cur.fetchall()] or health_concerns
-                    cur.execute("SELECT ingredient FROM pet_allergy WHERE pet_id = %s", (pet_id,))
+                    execute_traced(
+                        cur,
+                        "profile_node_allergies",
+                        "SELECT ingredient FROM pet_allergy WHERE pet_id = %s",
+                        (pet_id,),
+                        pet_id=pet_id,
+                    )
                     allergies = [r[0] for r in cur.fetchall()] or allergies
-                    cur.execute("SELECT food_type FROM pet_food_preference WHERE pet_id = %s", (pet_id,))
+                    execute_traced(
+                        cur,
+                        "profile_node_food_preferences",
+                        "SELECT food_type FROM pet_food_preference WHERE pet_id = %s",
+                        (pet_id,),
+                        pet_id=pet_id,
+                    )
                     food_prefs = [r[0] for r in cur.fetchall()] or food_prefs
 
         except Exception as e:
@@ -146,13 +187,20 @@ def profile_node(state: ChatState) -> dict:
             elif target_age >= 7: age_group = "시니어"
 
             # 품종명 + 연령대 우선 매칭
-            cur.execute("""
+            execute_traced(
+                cur,
+                "profile_node_breed_meta",
+                """
                 SELECT preferred_food, health_products, chunk_text
                 FROM breed_meta 
                 WHERE (breed_name = %s OR breed_name_en ILIKE %s)
                 ORDER BY CASE WHEN age_group = %s THEN 0 ELSE 1 END, id ASC
                 LIMIT 1
-            """, (target_breed, f"%{target_breed}%", age_group))
+                """,
+                (target_breed, f"%{target_breed}%", age_group),
+                breed=target_breed,
+                age_group=age_group,
+            )
             
             bm = cur.fetchone()
             if bm:
@@ -179,7 +227,16 @@ def profile_node(state: ChatState) -> dict:
             if conn is not None:
                 conn.close()
 
-    print(f"[PROFILE] user={user_id}, pet={pet_profile.get('name')}, breed={pet_profile.get('breed')}")
+    trace_log(
+        "profile_node_result",
+        user_id=user_id,
+        pet_name=pet_profile.get("name"),
+        breed=pet_profile.get("breed"),
+        health_concerns=len(health_concerns),
+        allergies=len(allergies),
+        food_preferences=len(food_prefs),
+        pet_mismatch=pet_mismatch,
+    )
     return {
         "pet_profile":      pet_profile,
         "health_concerns":  health_concerns,
@@ -229,7 +286,8 @@ def query_node(state: ChatState) -> dict:
     )
     try:
         ensure_request_active()
-        search_query = llm.chat.completions.create(
+        search_query = create_llm_completion(
+            trace_label="query_node_search_query",
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
@@ -237,9 +295,15 @@ def query_node(state: ChatState) -> dict:
     except Exception as e:
         fallback_parts = [category_hint, subcategory_hint, state["user_input"]]
         search_query = " ".join(part for part in fallback_parts if part).strip() or state["user_input"]
-        print(f"[QUERY] LLM 실패로 원문 기반 검색어 사용: {e}")
+        trace_log("query_node_fallback", error_type=type(e).__name__, error=str(e))
 
-    print(f"[QUERY] query={search_query!r}, relaxation={relaxation}")
+    trace_log(
+        "query_node_result",
+        query=search_query,
+        relaxation=relaxation,
+        category=category_hint,
+        subcategory=subcategory_hint,
+    )
     return {
         "search_query": search_query,
         "filters": {
@@ -358,7 +422,6 @@ def search_node(state: ChatState) -> dict:
     # [GP 보충] 5개 미만이면 모아보기(GP) 상품으로 보충
     _MIN_CANDIDATES = 5
     if len(candidates) < _MIN_CANDIDATES:
-        from final_ai.pipeline.utils import get_db_connection
         existing_ids = {c["goods_id"] for c in candidates}
         # 알레르기 여분 확보를 위해 더 넉넉하게 가져옴
         needed = max((_MIN_CANDIDATES - len(candidates)) * 4, 12)
@@ -401,7 +464,16 @@ def search_node(state: ChatState) -> dict:
                 " LIMIT %s"
             )
 
-            _cur.execute(gp_sql, gp_params + [needed])
+            execute_traced(
+                _cur,
+                "search_node_gp_fill",
+                gp_sql,
+                gp_params + [needed],
+                pet_type=pt_kr,
+                category=category,
+                subcategory=subcategory,
+                needed=needed,
+            )
             gp_cols = [d[0] for d in _cur.description]
             gp_rows = [dict(zip(gp_cols, row)) for row in _cur.fetchall()
                        if row[0] not in existing_ids]
@@ -507,7 +579,15 @@ def search_node(state: ChatState) -> dict:
             
         candidates = [c for c in candidates if is_safe(c)]
 
-    print(f"[SEARCH] {len(candidates)}개 후보 (relaxation={relaxation})")
+    trace_log(
+        "search_node_result",
+        candidate_count=len(candidates),
+        relaxation=relaxation,
+        pet_type=pt_kr,
+        category=category,
+        subcategory=subcategory,
+        allergies=len(allergies),
+    )
     return {"search_results": candidates}
 
 

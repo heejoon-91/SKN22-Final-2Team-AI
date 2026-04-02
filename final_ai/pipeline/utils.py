@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -25,10 +27,103 @@ _SUPPORTED_EMBED_MODELS = {
 }
 _embed_model_unavailable_reason = None
 _request_cancel_event: ContextVar[object | None] = ContextVar("request_cancel_event", default=None)
+_request_trace: ContextVar[dict | None] = ContextVar("request_trace", default=None)
 
 
 class RequestCancelled(RuntimeError):
     pass
+
+
+def _trim_text(value: str, limit: int = 160) -> str:
+    compact = " ".join(str(value).split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _normalize_trace_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _normalize_trace_value(v) for k, v in list(value.items())[:10]}
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+        if len(items) > 10:
+            items = items[:10] + ["..."]
+        return [_normalize_trace_value(item) for item in items]
+    return _trim_text(repr(value), limit=120)
+
+
+def _compact_sql(sql: str | None) -> str | None:
+    if not sql:
+        return None
+    return _trim_text(sql, limit=180)
+
+
+def get_request_trace() -> dict:
+    return dict(_request_trace.get() or {})
+
+
+def update_request_trace(**fields) -> None:
+    current = dict(_request_trace.get() or {})
+    current.update({key: _normalize_trace_value(value) for key, value in fields.items() if value is not None})
+    _request_trace.set(current)
+
+
+def trace_log(event: str, **fields) -> None:
+    payload = {**get_request_trace(), **{key: _normalize_trace_value(value) for key, value in fields.items() if value is not None}}
+    serialized = " ".join(
+        f"{key}={json.dumps(value, ensure_ascii=False)}"
+        for key, value in sorted(payload.items())
+    )
+    print(f"[FASTAPI_TRACE] event={event} {serialized}".rstrip())
+
+
+@contextmanager
+def bind_request_trace(request_id: str, **fields):
+    trace = {"request_id": request_id}
+    trace.update({key: _normalize_trace_value(value) for key, value in fields.items() if value is not None})
+    token = _request_trace.set(trace)
+    try:
+        yield
+    finally:
+        _request_trace.reset(token)
+
+
+@contextmanager
+def trace_block(event: str, **fields):
+    started_at = time.perf_counter()
+    trace_log(f"{event}_start", **fields)
+    try:
+        yield
+    except RequestCancelled:
+        trace_log(f"{event}_cancelled", elapsed_ms=round((time.perf_counter() - started_at) * 1000, 1), **fields)
+        raise
+    except Exception as exc:
+        trace_log(
+            f"{event}_error",
+            elapsed_ms=round((time.perf_counter() - started_at) * 1000, 1),
+            error_type=type(exc).__name__,
+            error=str(exc),
+            **fields,
+        )
+        raise
+    else:
+        trace_log(f"{event}_done", elapsed_ms=round((time.perf_counter() - started_at) * 1000, 1), **fields)
+
+
+def execute_traced(cur, label: str, sql: str, params=None, **fields) -> None:
+    params = params or ()
+    with trace_block(
+        "db_query",
+        label=label,
+        sql=_compact_sql(sql),
+        param_count=len(params) if hasattr(params, "__len__") else None,
+        **fields,
+    ):
+        cur.execute(sql, params)
 
 
 @contextmanager
@@ -142,6 +237,25 @@ class _LazyLLM:
 
 llm = _LazyLLM()
 
+
+def create_llm_completion(*, trace_label: str, **kwargs):
+    ensure_request_active()
+    model = kwargs.get("model")
+    with trace_block("llm_call", label=trace_label, model=model):
+        response = get_llm().chat.completions.create(**kwargs)
+    choice = None
+    if getattr(response, "choices", None):
+        choice = response.choices[0]
+    message = getattr(getattr(choice, "message", None), "content", "") or ""
+    trace_log(
+        "llm_call_result",
+        label=trace_label,
+        model=model,
+        output_chars=len(message),
+        finish_reason=getattr(choice, "finish_reason", None),
+    )
+    return response
+
 # ── DB 연결 설정 ────────────────────────────────────────────────────────────────
 _PET_SPECIES_KR = {
     "dog": "강아지",
@@ -240,16 +354,22 @@ def get_db_connection():
     - 배포 환경: RDS endpoint
     """
     host = (os.getenv("POSTGRES_HOST") or "localhost").strip() or "localhost"
-    return psycopg2.connect(
-        dbname=os.getenv("POSTGRES_DB", "tailtalk_db"),
-        user=os.getenv("POSTGRES_USER", "mungnyang"),
-        password=os.getenv("POSTGRES_PASSWORD", "finalprojectljs1908"),
+    with trace_block(
+        "db_connect",
         host=host,
-        port=os.getenv("POSTGRES_PORT", "5432"),
-        connect_timeout=POSTGRES_CONNECT_TIMEOUT_SECONDS,
-        options=f"-c statement_timeout={POSTGRES_STATEMENT_TIMEOUT_MS}",
-        application_name="tailtalk-fastapi",
-    )
+        db=os.getenv("POSTGRES_DB", "tailtalk_db"),
+        statement_timeout_ms=POSTGRES_STATEMENT_TIMEOUT_MS,
+    ):
+        return psycopg2.connect(
+            dbname=os.getenv("POSTGRES_DB", "tailtalk_db"),
+            user=os.getenv("POSTGRES_USER", "mungnyang"),
+            password=os.getenv("POSTGRES_PASSWORD", "finalprojectljs1908"),
+            host=host,
+            port=os.getenv("POSTGRES_PORT", "5432"),
+            connect_timeout=POSTGRES_CONNECT_TIMEOUT_SECONDS,
+            options=f"-c statement_timeout={POSTGRES_STATEMENT_TIMEOUT_MS}",
+            application_name="tailtalk-fastapi",
+        )
 
 # ── 임베딩 모델 (lazy loading) ──────────────────────────────────────────────────
 _embed_model = None
@@ -319,184 +439,225 @@ def hybrid_search_pg(query: str, top_k: int = 20,
     PostgreSQL의 pgvector(embedding 컬럼)와 tsvector(search_vector 컬럼)를
     이용한 Hybrid Search 후 RRF(Reciprocal Rank Fusion)로 상위 결과 반환.
     """
-    query_vec = embed_query(query)
-    pet_type_kr = normalize_pet_species(pet_type) or pet_type
-    k = 60  # RRF 상수
+    with trace_block(
+        "hybrid_search",
+        query=query,
+        top_k=top_k,
+        pet_type=pet_type,
+        category=category,
+        subcategory=subcategory,
+        budget=budget,
+    ):
+        query_vec = embed_query(query)
+        pet_type_kr = normalize_pet_species(pet_type) or pet_type
+        k = 60  # RRF 상수
 
-    conn = None
-    cur = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+        conn = None
+        cur = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            vec_sql = """
+                SELECT goods_id, goods_name, pet_type, category, subcategory,
+                       price, thumbnail_url, product_url, brand_name, discount_price,
+                       popularity_score, sentiment_avg, repeat_rate, health_concern_tags,
+                       rating, review_count, main_ingredients
+                FROM product
+                WHERE 1=1 {filters}
+                ORDER BY embedding <=> %s::vector
+                LIMIT 100
+            """
+            keyword_sql = """
+                SELECT goods_id, goods_name, pet_type, category, subcategory,
+                       price, thumbnail_url, product_url, brand_name, discount_price,
+                       popularity_score, sentiment_avg, repeat_rate, health_concern_tags,
+                       rating, review_count, main_ingredients
+                FROM product
+                WHERE search_vector @@ plainto_tsquery('simple', %s) {filters}
+                ORDER BY ts_rank(search_vector, plainto_tsquery('simple', %s)) DESC
+                LIMIT 100
+            """
+            pop_sql = """
+                SELECT goods_id, goods_name, pet_type, category, subcategory,
+                       price, thumbnail_url, product_url, brand_name, discount_price,
+                       popularity_score, sentiment_avg, repeat_rate, health_concern_tags,
+                       rating, review_count, main_ingredients
+                FROM product
+                WHERE 1=1 {filters}
+                ORDER BY popularity_score DESC NULLS LAST, review_count DESC NULLS LAST
+                LIMIT 100
+            """
 
-        # [A] 벡터 검색 (코사인 유사도 기반)
-        vec_sql = """
-            SELECT goods_id, goods_name, pet_type, category, subcategory,
-                   price, thumbnail_url, product_url, brand_name, discount_price,
-                   popularity_score, sentiment_avg, repeat_rate, health_concern_tags,
-                   rating, review_count, main_ingredients
-            FROM product
-            WHERE 1=1 {filters}
-            ORDER BY embedding <=> %s::vector
-            LIMIT 100
-        """
-        keyword_sql = """
-            SELECT goods_id, goods_name, pet_type, category, subcategory,
-                   price, thumbnail_url, product_url, brand_name, discount_price,
-                   popularity_score, sentiment_avg, repeat_rate, health_concern_tags,
-                   rating, review_count, main_ingredients
-            FROM product
-            WHERE search_vector @@ plainto_tsquery('simple', %s) {filters}
-            ORDER BY ts_rank(search_vector, plainto_tsquery('simple', %s)) DESC
-            LIMIT 100
-        """
-        # [C] 인기도 기반 검색 (상위 100개) - 초기 후보군에 인기 상품 강제 포함용
-        pop_sql = """
-            SELECT goods_id, goods_name, pet_type, category, subcategory,
-                   price, thumbnail_url, product_url, brand_name, discount_price,
-                   popularity_score, sentiment_avg, repeat_rate, health_concern_tags,
-                   rating, review_count, main_ingredients
-            FROM product
-            WHERE 1=1 {filters}
-            ORDER BY popularity_score DESC NULLS LAST, review_count DESC NULLS LAST
-            LIMIT 100
-        """
+            filter_parts = [
+                "AND goods_name NOT ILIKE '%%샘플%%'",
+                "AND goods_id NOT LIKE 'GP%%'",
+            ]
+            filter_params_shared = []
 
-        # 공통 필터 조건 구성
-        filter_parts = [
-            "AND goods_name NOT ILIKE '%%샘플%%'",
-            "AND goods_id NOT LIKE 'GP%%'"
-        ]
-        filter_params_shared = []
+            if pet_type_kr:
+                filter_parts.append("AND %s = ANY(pet_type)")
+                filter_params_shared.append(pet_type_kr)
+            if category:
+                filter_parts.append("AND (%s = ANY(category) OR %s = ANY(subcategory))")
+                filter_params_shared.extend([category, category])
+            if subcategory:
+                filter_parts.append("AND %s = ANY(subcategory)")
+                filter_params_shared.append(subcategory)
+            if budget:
+                filter_parts.append("AND price <= %s")
+                filter_params_shared.append(budget)
 
-        if pet_type_kr:
-            filter_parts.append("AND %s = ANY(pet_type)")
-            filter_params_shared.append(pet_type_kr)
-        if category:
-            filter_parts.append("AND (%s = ANY(category) OR %s = ANY(subcategory))")
-            filter_params_shared.extend([category, category])
-        if subcategory:
-            filter_parts.append("AND %s = ANY(subcategory)")
-            filter_params_shared.append(subcategory)
-        if budget:
-            filter_parts.append("AND price <= %s")
-            filter_params_shared.append(budget)
+            filter_str = " ".join(filter_parts)
 
-        filter_str = " ".join(filter_parts)
+            cols = []
+            vec_rows = []
+            if query_vec is not None:
+                execute_traced(
+                    cur,
+                    "hybrid_search_vector",
+                    vec_sql.format(filters=filter_str),
+                    filter_params_shared + [query_vec],
+                    category=category,
+                    subcategory=subcategory,
+                )
+                cols = [d[0] for d in cur.description]
+                vec_rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+                trace_log("db_query_rows", label="hybrid_search_vector", row_count=len(vec_rows))
 
-        cols = []
-        vec_rows = []
-        if query_vec is not None:
-            # [A] 벡터 검색 파라미터
-            cur.execute(vec_sql.format(filters=filter_str), filter_params_shared + [query_vec])
-            cols = [d[0] for d in cur.description]
-            vec_rows = [dict(zip(cols, row)) for row in cur.fetchall()]
-        
-        # [B] 키워드 검색
-        cur.execute(keyword_sql.format(filters=filter_str), [query] + filter_params_shared + [query])
-        kw_cols = [d[0] for d in cur.description]
-        if not cols: cols = kw_cols
-        kw_rows = [dict(zip(kw_cols, row)) for row in cur.fetchall()]
+            execute_traced(
+                cur,
+                "hybrid_search_keyword",
+                keyword_sql.format(filters=filter_str),
+                [query] + filter_params_shared + [query],
+                category=category,
+                subcategory=subcategory,
+            )
+            kw_cols = [d[0] for d in cur.description]
+            if not cols:
+                cols = kw_cols
+            kw_rows = [dict(zip(kw_cols, row)) for row in cur.fetchall()]
+            trace_log("db_query_rows", label="hybrid_search_keyword", row_count=len(kw_rows))
 
-        # [C] 인기도 검색 (추가)
-        cur.execute(pop_sql.format(filters=filter_str), filter_params_shared)
-        pop_cols = [d[0] for d in cur.description]
-        pop_rows = [dict(zip(pop_cols, row)) for row in cur.fetchall()]
+            execute_traced(
+                cur,
+                "hybrid_search_popularity",
+                pop_sql.format(filters=filter_str),
+                filter_params_shared,
+                category=category,
+                subcategory=subcategory,
+            )
+            pop_cols = [d[0] for d in cur.description]
+            pop_rows = [dict(zip(pop_cols, row)) for row in cur.fetchall()]
+            trace_log("db_query_rows", label="hybrid_search_popularity", row_count=len(pop_rows))
 
-        # 자연어 질문이 search_vector와 정확히 맞지 않는 경우를 위한 느슨한 폴백 검색.
-        if not vec_rows and not kw_rows:
-            loose_terms = _extract_search_terms(query, category, subcategory)
-            if loose_terms:
-                score_parts = []
-                score_params = []
-                where_parts = []
-                where_params = []
+            if not vec_rows and not kw_rows:
+                loose_terms = _extract_search_terms(query, category, subcategory)
+                if loose_terms:
+                    score_parts = []
+                    score_params = []
+                    where_parts = []
+                    where_params = []
 
-                for term in loose_terms:
-                    like = f"%{term}%"
-                    score_parts.append(
-                        "("
-                        "CASE WHEN goods_name ILIKE %s THEN 5 ELSE 0 END + "
-                        "CASE WHEN brand_name ILIKE %s THEN 2 ELSE 0 END + "
-                        "CASE WHEN COALESCE(array_to_string(category, ' '), '') ILIKE %s THEN 3 ELSE 0 END + "
-                        "CASE WHEN COALESCE(array_to_string(subcategory, ' '), '') ILIKE %s THEN 4 ELSE 0 END + "
-                        "CASE WHEN COALESCE(array_to_string(health_concern_tags, ' '), '') ILIKE %s THEN 4 ELSE 0 END"
-                        ")"
+                    for term in loose_terms:
+                        like = f"%{term}%"
+                        score_parts.append(
+                            "("
+                            "CASE WHEN goods_name ILIKE %s THEN 5 ELSE 0 END + "
+                            "CASE WHEN brand_name ILIKE %s THEN 2 ELSE 0 END + "
+                            "CASE WHEN COALESCE(array_to_string(category, ' '), '') ILIKE %s THEN 3 ELSE 0 END + "
+                            "CASE WHEN COALESCE(array_to_string(subcategory, ' '), '') ILIKE %s THEN 4 ELSE 0 END + "
+                            "CASE WHEN COALESCE(array_to_string(health_concern_tags, ' '), '') ILIKE %s THEN 4 ELSE 0 END"
+                            ")"
+                        )
+                        score_params.extend([like, like, like, like, like])
+                        where_parts.append(
+                            "("
+                            "goods_name ILIKE %s OR "
+                            "brand_name ILIKE %s OR "
+                            "COALESCE(array_to_string(category, ' '), '') ILIKE %s OR "
+                            "COALESCE(array_to_string(subcategory, ' '), '') ILIKE %s OR "
+                            "COALESCE(array_to_string(health_concern_tags, ' '), '') ILIKE %s"
+                            ")"
+                        )
+                        where_params.extend([like, like, like, like, like])
+
+                    loose_sql = f"""
+                        SELECT goods_id, goods_name, pet_type, category, subcategory,
+                               price, thumbnail_url, product_url, brand_name, discount_price,
+                               popularity_score, sentiment_avg, repeat_rate, health_concern_tags,
+                               rating, review_count, main_ingredients,
+                               ({' + '.join(score_parts)}) AS loose_score
+                        FROM product
+                        WHERE 1=1 {filter_str}
+                          AND ({' OR '.join(where_parts)})
+                        ORDER BY loose_score DESC,
+                                 popularity_score DESC NULLS LAST,
+                                 review_count DESC NULLS LAST,
+                                 price ASC
+                        LIMIT 100
+                    """
+                    execute_traced(
+                        cur,
+                        "hybrid_search_loose_fallback",
+                        loose_sql,
+                        score_params + filter_params_shared + where_params,
+                        terms=loose_terms,
                     )
-                    score_params.extend([like, like, like, like, like])
-                    where_parts.append(
-                        "("
-                        "goods_name ILIKE %s OR "
-                        "brand_name ILIKE %s OR "
-                        "COALESCE(array_to_string(category, ' '), '') ILIKE %s OR "
-                        "COALESCE(array_to_string(subcategory, ' '), '') ILIKE %s OR "
-                        "COALESCE(array_to_string(health_concern_tags, ' '), '') ILIKE %s"
-                        ")"
+                    loose_cols = [d[0] for d in cur.description]
+                    kw_rows = [dict(zip(loose_cols, row)) for row in cur.fetchall()]
+                    trace_log(
+                        "db_query_rows",
+                        label="hybrid_search_loose_fallback",
+                        row_count=len(kw_rows),
                     )
-                    where_params.extend([like, like, like, like, like])
+                    if kw_rows:
+                        print(
+                            f"[hybrid_search_pg] loose fallback search matched "
+                            f"{len(kw_rows)} rows for query={query!r}, terms={loose_terms}"
+                        )
 
-                loose_sql = f"""
-                    SELECT goods_id, goods_name, pet_type, category, subcategory,
-                           price, thumbnail_url, product_url, brand_name, discount_price,
-                           popularity_score, sentiment_avg, repeat_rate, health_concern_tags,
-                           rating, review_count, main_ingredients,
-                           ({' + '.join(score_parts)}) AS loose_score
-                    FROM product
-                    WHERE 1=1 {filter_str}
-                      AND ({' OR '.join(where_parts)})
-                    ORDER BY loose_score DESC,
-                             popularity_score DESC NULLS LAST,
-                             review_count DESC NULLS LAST,
-                             price ASC
-                    LIMIT 100
-                """
-                cur.execute(loose_sql, score_params + filter_params_shared + where_params)
-                loose_cols = [d[0] for d in cur.description]
-                kw_rows = [dict(zip(loose_cols, row)) for row in cur.fetchall()]
-                if kw_rows:
-                    print(
-                        f"[hybrid_search_pg] loose fallback search matched "
-                        f"{len(kw_rows)} rows for query={query!r}, terms={loose_terms}"
-                    )
+            scores: dict[str, float] = {}
+            rows_by_id: dict[str, dict] = {}
 
-        # [D] RRF 점수 계산 (벡터 + 키워드 + 인기도 통합)
-        scores: dict[str, float] = {}
-        rows_by_id: dict[str, dict] = {}
+            for rank, row in enumerate(vec_rows):
+                gid = row["goods_id"]
+                scores[gid] = scores.get(gid, 0) + 1 / (k + rank + 1)
+                rows_by_id[gid] = row
 
-        for rank, row in enumerate(vec_rows):
-            gid = row["goods_id"]
-            scores[gid] = scores.get(gid, 0) + 1 / (k + rank + 1)
-            rows_by_id[gid] = row
+            for rank, row in enumerate(kw_rows):
+                gid = row["goods_id"]
+                scores[gid] = scores.get(gid, 0) + 1 / (k + rank + 1)
+                rows_by_id[gid] = row
 
-        for rank, row in enumerate(kw_rows):
-            gid = row["goods_id"]
-            scores[gid] = scores.get(gid, 0) + 1 / (k + rank + 1)
-            rows_by_id[gid] = row
-            
-        for rank, row in enumerate(pop_rows):
-            gid = row["goods_id"]
-            # 인기도 기반 순위도 RRF에 합산하여 후보군 진입 장벽 낮춤
-            scores[gid] = scores.get(gid, 0) + 1 / (k + rank + 1)
-            rows_by_id[gid] = row
+            for rank, row in enumerate(pop_rows):
+                gid = row["goods_id"]
+                scores[gid] = scores.get(gid, 0) + 1 / (k + rank + 1)
+                rows_by_id[gid] = row
 
-        # [C] 정렬 후 상위 반환
-        sorted_ids = sorted(scores, key=lambda x: scores[x], reverse=True)
-        results = []
-        for gid in sorted_ids[:top_k]:
-            row = rows_by_id[gid]
-            row["_score"] = scores[gid]
-            results.append(row)
+            sorted_ids = sorted(scores, key=lambda x: scores[x], reverse=True)
+            results = []
+            for gid in sorted_ids[:top_k]:
+                row = rows_by_id[gid]
+                row["_score"] = scores[gid]
+                results.append(row)
 
-        return results
+            trace_log(
+                "hybrid_search_result",
+                vector_rows=len(vec_rows),
+                keyword_rows=len(kw_rows),
+                popularity_rows=len(pop_rows),
+                result_count=len(results),
+            )
+            return results
 
-    except Exception as e:
-        print(f"[hybrid_search_pg] 오류: {e}")
-        return []
-    finally:
-        if cur is not None:
-            cur.close()
-        if conn is not None:
-            conn.close()
+        except Exception as e:
+            print(f"[hybrid_search_pg] 오류: {e}")
+            return []
+        finally:
+            if cur is not None:
+                cur.close()
+            if conn is not None:
+                conn.close()
 
 
 # ── 공통 헬퍼 ───────────────────────────────────────────────────────────────────
@@ -556,8 +717,15 @@ def get_user_pets(user_id: str) -> list[dict]:
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT pet_id, name, species, breed, age_years FROM pet WHERE user_id = %s", (user_id,))
+        execute_traced(
+            cur,
+            "get_user_pets",
+            "SELECT pet_id, name, species, breed, age_years FROM pet WHERE user_id = %s",
+            (user_id,),
+            user_id=user_id,
+        )
         rows = cur.fetchall()
+        trace_log("db_query_rows", label="get_user_pets", row_count=len(rows), user_id=user_id)
         return [{"pet_id": str(r[0]), "name": r[1], "species": r[2], "breed": r[3], "age": f"{r[4]}살"} for r in rows]
     except Exception as e:
         print(f"[get_user_pets] 오류: {e}")
@@ -577,7 +745,13 @@ def get_pet_full_profile(pet_id: str) -> dict:
         cur = conn.cursor()
         
         # 1. 기본 정보
-        cur.execute("SELECT name, species, breed, age_years, gender, weight_kg FROM pet WHERE pet_id = %s", (pet_id,))
+        execute_traced(
+            cur,
+            "get_pet_full_profile_base",
+            "SELECT name, species, breed, age_years, gender, weight_kg FROM pet WHERE pet_id = %s",
+            (pet_id,),
+            pet_id=pet_id,
+        )
         base = cur.fetchone()
         if not base: return {}
         
@@ -597,16 +771,52 @@ def get_pet_full_profile(pet_id: str) -> dict:
         }
         
         # 2. 건강 관심사
-        cur.execute("SELECT concern FROM pet_health_concern WHERE pet_id = %s", (pet_id,))
+        execute_traced(
+            cur,
+            "get_pet_full_profile_concerns",
+            "SELECT concern FROM pet_health_concern WHERE pet_id = %s",
+            (pet_id,),
+            pet_id=pet_id,
+        )
         res["health_concerns"] = [r[0] for r in cur.fetchall()]
-        
+        trace_log(
+            "db_query_rows",
+            label="get_pet_full_profile_concerns",
+            row_count=len(res["health_concerns"]),
+            pet_id=pet_id,
+        )
+
         # 3. 알러지
-        cur.execute("SELECT ingredient FROM pet_allergy WHERE pet_id = %s", (pet_id,))
+        execute_traced(
+            cur,
+            "get_pet_full_profile_allergies",
+            "SELECT ingredient FROM pet_allergy WHERE pet_id = %s",
+            (pet_id,),
+            pet_id=pet_id,
+        )
         res["allergies"] = [r[0] for r in cur.fetchall()]
-        
+        trace_log(
+            "db_query_rows",
+            label="get_pet_full_profile_allergies",
+            row_count=len(res["allergies"]),
+            pet_id=pet_id,
+        )
+
         # 4. 사료 선호도
-        cur.execute("SELECT food_type FROM pet_food_preference WHERE pet_id = %s", (pet_id,))
+        execute_traced(
+            cur,
+            "get_pet_full_profile_food_preferences",
+            "SELECT food_type FROM pet_food_preference WHERE pet_id = %s",
+            (pet_id,),
+            pet_id=pet_id,
+        )
         res["food_preferences"] = [r[0] for r in cur.fetchall()]
+        trace_log(
+            "db_query_rows",
+            label="get_pet_full_profile_food_preferences",
+            row_count=len(res["food_preferences"]),
+            pet_id=pet_id,
+        )
         
         return res
     except Exception as e:

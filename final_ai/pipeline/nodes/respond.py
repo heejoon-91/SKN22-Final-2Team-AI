@@ -4,10 +4,11 @@ from final_ai.pipeline.state import ChatState
 from final_ai.pipeline.utils import (
     LLM_MODEL,
     build_pet_context,
+    create_llm_completion,
     ensure_request_active,
-    llm,
+    get_user_pets,
+    trace_log,
     translate_health_concerns,
-    get_user_pets
 )
 
 # RESPOND_SYSTEM = """\
@@ -133,7 +134,8 @@ def respond_node(state: ChatState) -> dict:
 
     try:
         ensure_request_active()
-        response = llm.chat.completions.create(
+        response = create_llm_completion(
+            trace_label="respond_node_response",
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": RESPOND_SYSTEM},
@@ -148,9 +150,14 @@ def respond_node(state: ChatState) -> dict:
             response = "관련 정보를 찾았지만 답변 생성 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요."
         else:
             response = "지금은 추천 정보를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
-        print(f"[RESPOND] LLM 실패로 폴백 응답 사용: {e}")
+        trace_log("respond_node_fallback", error_type=type(e).__name__, error=str(e))
 
-    print(f"[RESPOND] {response[:80]}...")
+    trace_log(
+        "respond_node_result",
+        response_chars=len(response),
+        product_cards=len(reranked_results),
+        domain_contexts=len(domain_contexts),
+    )
     return {
         "messages": [AIMessage(content=response)],
         "response": response,

@@ -4,7 +4,12 @@ from pathlib import Path
 from final_ai.observability import traceable
 from final_ai.pipeline.state import ChatState
 from final_ai.pipeline.utils import (
-    LLM_MODEL, ensure_request_active, llm, get_user_pets, get_pet_full_profile
+    LLM_MODEL,
+    create_llm_completion,
+    ensure_request_active,
+    get_pet_full_profile,
+    get_user_pets,
+    trace_log,
 )
 
 CATEGORY_FILE = Path(__file__).resolve().parents[1] / "data" / "category.json"
@@ -76,7 +81,8 @@ def intent_node(state: ChatState) -> dict:
 
     # 2. LLM 호출
     ensure_request_active()
-    res = llm.chat.completions.create(
+    res = create_llm_completion(
+        trace_label="intent_node_classification",
         model=LLM_MODEL,
         messages=[
             {"role": "system", "content": INTENT_SYSTEM + context},
@@ -92,6 +98,14 @@ def intent_node(state: ChatState) -> dict:
     is_next_request = r.get("is_next_request", False)
     target_categories = r.get("target_categories") or []
     is_explicit_pet_info = bool(r.get("pet_type") or r.get("breed"))
+    trace_log(
+        "intent_node_result",
+        intents=new_intents,
+        target_categories=target_categories,
+        mentioned_pet_names=mentioned_names,
+        is_next_request=is_next_request,
+        explicit_pet_info=is_explicit_pet_info,
+    )
 
     is_pet_switched = False
     switched_pet_name = None
