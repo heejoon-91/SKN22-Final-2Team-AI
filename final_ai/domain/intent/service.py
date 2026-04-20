@@ -15,6 +15,7 @@ from final_ai.contracts.filters import (
 )
 from final_ai.domain.intent.prompts import CATEGORIES, build_intent_prompt
 from final_ai.domain.profile.service import get_pet_full_profile, get_user_pets
+from final_ai.domain.recommendation.constants import ALLERGY_TERM_ALIASES
 from final_ai.infrastructure.llm.openai_client import LLM_MODEL, llm
 from final_ai.infrastructure.observability import get_logger
 from final_ai.graph.state import ChatState
@@ -174,6 +175,29 @@ def _extract_exclusion_keywords_from_text(text: str | None) -> list[str]:
         add_candidate(match.group(1))
 
     return found
+
+
+def _extract_exclusion_ingredients_from_text(text: str | None) -> list[str]:
+    candidates = _extract_exclusion_keywords_from_text(text)
+    if not candidates:
+        return []
+
+    known_ingredients = {
+        _normalize_compact_text(alias)
+        for aliases in ALLERGY_TERM_ALIASES.values()
+        for alias in aliases
+    }
+    known_ingredients.update(_normalize_compact_text(key) for key in ALLERGY_TERM_ALIASES)
+
+    ingredients = []
+    seen = set()
+    for candidate in candidates:
+        normalized = _normalize_compact_text(candidate)
+        if normalized not in known_ingredients or normalized in seen:
+            continue
+        seen.add(normalized)
+        ingredients.append(candidate)
+    return ingredients
 
 
 def _merge_search_exclusions(*values: SearchExclusions | None) -> SearchExclusions:
@@ -510,6 +534,10 @@ def classify_intent(state: ChatState) -> dict:
     if detected_brand and _has_exclusion_signal(original_user_input):
         exclude_brands = _merge_unique_terms(exclude_brands, [detected_brand])
         detected_brand = None
+    exclude_ingredients = _merge_unique_terms(
+        exclude_ingredients,
+        _extract_exclusion_ingredients_from_text(original_user_input),
+    )
     if not (
         exclude_brands
         or exclude_categories

@@ -245,9 +245,21 @@ def _is_excluded_candidate(candidate: dict, *, exclusions: dict[str, list[str]])
         if concern_term and any(concern_term in value for value in product_tags):
             return True
 
+    expanded_ingredient_terms = []
     for ingredient in exclusions.get("ingredients") or []:
         ingredient_term = _normalize_text(ingredient)
-        if ingredient_term and any(ingredient_term in value for value in [goods_name, ingredient_ocr, *normalized_main_ingredients]):
+        if not ingredient_term:
+            continue
+        expanded_ingredient_terms.append(ingredient_term)
+        for aliases in ALLERGY_TERM_ALIASES.values():
+            normalized_aliases = {_normalize_text(alias) for alias in aliases}
+            if ingredient_term in normalized_aliases:
+                expanded_ingredient_terms.extend(normalized_aliases)
+
+    for ingredient_term in set(expanded_ingredient_terms):
+        ingredient_fields = [ingredient_ocr, *normalized_main_ingredients]
+        searchable_ingredient_fields = ingredient_fields if len(ingredient_term) <= 1 else [goods_name, *ingredient_fields]
+        if ingredient_term and any(ingredient_term in value for value in searchable_ingredient_fields):
             return True
 
     for keyword in exclusions.get("keywords") or []:
@@ -371,7 +383,7 @@ def execute_search_state(state: ChatState) -> dict:
             if _matches_budget(candidate, min_budget=min_budget, budget=budget)
         ]
     logger.info(
-        "search hybrid returned=%s relaxation=%s relaxed=%s subcategory=%s category=%s pet=%s health=%s allowed_ids=%s refinement=%s",
+        "search hybrid returned=%s relaxation=%s relaxed=%s subcategory=%s category=%s pet=%s health=%s exclusions=%s allowed_ids=%s refinement=%s",
         len(candidates),
         relaxation,
         build_relaxed_filter_names(
@@ -385,6 +397,7 @@ def execute_search_state(state: ChatState) -> dict:
         category,
         pet_type_kr,
         search_health_concerns,
+        exclusions,
         len(allowed_goods_ids),
         bool(state.get("is_result_refinement")),
     )
@@ -465,6 +478,7 @@ def execute_search_state(state: ChatState) -> dict:
         ],
         "original_filters": original_filters,
         "effective_filters": filters,
+        "exclusions": exclusions,
         "relaxed_filters": relaxed_filters,
         "candidate_count_by_stage": candidate_count_by_stage,
         "requested_product_terms": requested_product_terms,

@@ -49,6 +49,9 @@ def invoke_chat_graph(initial_state: dict, config: dict) -> dict:
                 f = updates["filters"]
                 f_str = f"펫:{f.get('pet_type')}, 카테:{f.get('category')}, 서브:{f.get('subcategory')}"
                 _pretty_print(f"      └─ 필터: [{f_str}]")
+
+            if "exclusions" in updates:
+                _pretty_print(f"      └─ 제외조건: {json.dumps(updates['exclusions'], ensure_ascii=False)}")
             
             if "search_query" in updates:
                 _pretty_print(f"      └─ 검색어: {updates['search_query']}")
