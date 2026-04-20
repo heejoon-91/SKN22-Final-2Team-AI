@@ -1,5 +1,8 @@
 import json
 import sys
+from collections.abc import Callable
+
+from final_ai.application.chat.search_progress import build_search_progress_messages
 from final_ai.graph.builder import build_graph
 from final_ai.infrastructure.observability import traceable, get_logger
 
@@ -19,10 +22,15 @@ def _pretty_print(msg: str, indent: int = 0):
     sys.stdout.flush()
 
 @traceable(name="tailtalk_fastapi_chat_graph", run_type="chain")
-def invoke_chat_graph(initial_state: dict, config: dict) -> dict:
+def invoke_chat_graph(
+    initial_state: dict,
+    config: dict,
+    progress_callback: Callable[[dict], None] | None = None,
+) -> dict:
     graph = get_chat_graph()
     final_state = {}
     WIDTH = 70
+    emitted_search_progress = False
 
     # 시작 알림 박스
     _pretty_print("")
@@ -37,6 +45,7 @@ def invoke_chat_graph(initial_state: dict, config: dict) -> dict:
     for event in graph.stream(initial_state, config=config, stream_mode="updates"):
         for node_name, updates in event.items():
             _pretty_print(f"  ──▶ [NODE: {node_name.upper()}] 완료")
+            next_state = {**final_state, **updates}
             
             # 출력할 주요 데이터
             if "intents" in updates:
@@ -63,7 +72,17 @@ def invoke_chat_graph(initial_state: dict, config: dict) -> dict:
                 res = updates['response'].replace("\n", " ")
                 res_display = (res[:WIDTH-20] + "..") if len(res) > WIDTH-20 else res
                 _pretty_print(f"      └─ 응답: {res_display}")
-            
+
+            if (
+                progress_callback
+                and not emitted_search_progress
+                and node_name == "query"
+                and "search_query" in updates
+            ):
+                for message in build_search_progress_messages(next_state):
+                    progress_callback({"content": message})
+                emitted_search_progress = True
+
             final_state.update(updates)
 
     # 종료 알림 박스

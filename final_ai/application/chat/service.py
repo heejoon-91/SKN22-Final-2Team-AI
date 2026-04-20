@@ -71,12 +71,18 @@ async def stream_chat_events(req: ChatRequest, request: Request) -> AsyncIterato
         }
     )
 
-    pet_name = get_pet_name_for_user(req.user_id, req.target_pet_id)
+    pet_name = get_pet_name_for_user(req.user_id, req.target_pet_id) or "반려동물"
     category = _infer_category(req.message)
     logger.info("chat stream started", extra=log_extra)
-    yield "info", {"content": f"{pet_name}에 어울리는 {category}를 찾는 중입니다..."}
+    yield "info", {"content": f"{pet_name}에 어울리는 {category} 조건을 확인하는 중입니다..."}
 
     cancel_event = threading.Event()
+    progress_queue: asyncio.Queue[tuple[ChatEventType, dict]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def enqueue_progress(payload: dict):
+        loop.call_soon_threadsafe(progress_queue.put_nowait, ("info", payload))
+
     try:
         with bind_request_cancel_event(cancel_event):
             graph_task = asyncio.create_task(
@@ -84,6 +90,7 @@ async def stream_chat_events(req: ChatRequest, request: Request) -> AsyncIterato
                     invoke_chat_graph,
                     execution_request.initial_state,
                     execution_request.config,
+                    enqueue_progress,
                 ),
             )
 
@@ -93,8 +100,18 @@ async def stream_chat_events(req: ChatRequest, request: Request) -> AsyncIterato
                     graph_task.cancel()
                     logger.info("chat stream disconnected", extra=log_extra)
                     return
+                try:
+                    while True:
+                        yield progress_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
                 await asyncio.sleep(0.25)
 
+            try:
+                while True:
+                    yield progress_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
             final_state = await graph_task
     except RequestCancelled:
         logger.info("chat stream cancelled", extra=log_extra)
